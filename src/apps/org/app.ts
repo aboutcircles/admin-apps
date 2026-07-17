@@ -20,6 +20,7 @@ import { gnosis } from 'viem/chains';
 import { onWalletChange, sendTransactions } from '@aboutcircles/miniapp-sdk';
 import { Sdk } from '@aboutcircles/sdk';
 import { cidV0ToHex } from '@aboutcircles/sdk-utils';
+import { CirclesConverter } from '@aboutcircles/sdk-utils/circlesConverter';
 import {
   getCompatibilityFallbackHandlerDeployment,
   getMultiSendCallOnlyDeployment,
@@ -975,6 +976,7 @@ function hideAllSections() {
   optionsSection.classList.add('hidden');
   registerSection.classList.add('hidden');
   dashboardSection.classList.add('hidden');
+  byId('explorer-section')?.classList.add('hidden');
 }
 
 function showDisconnectedState() {
@@ -2629,6 +2631,446 @@ if (orgImageDropzone && orgImageInput) {
     }
   });
 }
+
+/* ── Organization Explorer ───────────────────────────────────────── */
+// Read-only: works with or without a connected wallet. Paste any org address
+// and its Circles activity loads — direction (in/out), the proper amount per
+// Circles token type (personal/group ERC1155, demurraged/inflationary ERC20
+// wrappers — inflationary static amounts are converted to demurraged CRC at
+// the transfer's timestamp), and the avatar behind each token, resolved to a
+// profile name.
+
+const explorerSection = byId('explorer-section');
+const explorerAddressInput = byId('explorer-address');
+const explorerLoadBtn = byId('explorer-load-btn');
+const explorerOrgHeader = byId('explorer-org-header');
+const explorerOrgAvatarWrap = byId('explorer-org-avatar-wrap');
+const explorerOrgAvatar = byId('explorer-org-avatar');
+const explorerOrgName = byId('explorer-org-name');
+const explorerOrgAddressEl = byId('explorer-org-address');
+const explorerOrgTypeEl = byId('explorer-org-type');
+const explorerOrgDescription = byId('explorer-org-description');
+const explorerActivityWrap = byId('explorer-activity');
+const explorerActivityList = byId('explorer-activity-list');
+const explorerLoadMoreBtn = byId('explorer-load-more-btn');
+const explorerBackBtn = byId('explorer-back-btn');
+const loginExploreBtn = byId('login-explore-btn');
+const optionsExploreBtn = byId('options-explore-btn');
+const viewOrgActivityBtn = byId('view-org-activity-btn');
+
+const EXPLORER_PAGE_SIZE = 25;
+let explorerOrg: string | null = null; // lowercased address currently shown
+let explorerCursor: { blockNumber: number; logIndex: number } | null = null;
+let explorerReturnTo: string | null = null; // 'dashboard' when opened from an open org
+let explorerLoadSeq = 0;
+const explorerProfileCache = new Map<string, { name: string; imageUrl: string | null } | null>();
+const wrapperOwnerCache = new Map<string, string | null>();
+
+type TransferRow = Record<string, any>;
+
+async function circlesQuery(params: Record<string, unknown>): Promise<TransferRow[]> {
+  const response = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'circles_query', params: [params] }),
+  });
+  const json = await response.json();
+  if (json.error) throw new Error(json.error.message || 'Circles RPC error');
+  const { columns, rows } = json.result || { columns: [], rows: [] };
+  return (rows || []).map((row: unknown[]) =>
+    Object.fromEntries(columns.map((c: string, i: number) => [c, row[i]]))
+  );
+}
+
+async function fetchExplorerProfiles(addresses: string[]): Promise<void> {
+  const missing = [...new Set(addresses.map((a) => a.toLowerCase()))].filter(
+    (a) => isAddress(a) && a !== zeroAddress && !explorerProfileCache.has(a)
+  );
+  if (missing.length === 0) return;
+  try {
+    const response = await fetch(RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'circles_getProfileByAddressBatch',
+        params: [missing],
+      }),
+    });
+    const json = await response.json();
+    (json.result || []).forEach((profile: any, i: number) => {
+      explorerProfileCache.set(
+        missing[i],
+        profile?.name
+          ? { name: profile.name, imageUrl: profile.previewImageUrl || profile.imageUrl || null }
+          : null
+      );
+    });
+  } catch {
+    /* profiles are cosmetic — leave uncached and fall back to addresses */
+  }
+}
+
+// The avatar behind a token: 1155 rows carry it directly (tokenAddress); for
+// ERC20 wrapper rows resolve wrapper -> tokenOwner via the Tokens view.
+async function resolveWrapperOwners(wrapperAddresses: string[]): Promise<void> {
+  const missing = [...new Set(wrapperAddresses.map((a) => a.toLowerCase()))].filter(
+    (a) => !wrapperOwnerCache.has(a)
+  );
+  await Promise.all(
+    missing.map(async (wrapper) => {
+      try {
+        const rows = await circlesQuery({
+          Namespace: 'V_Crc',
+          Table: 'Tokens',
+          Columns: [],
+          Filter: [
+            { Type: 'FilterPredicate', FilterType: 'Equals', Column: 'token', Value: wrapper },
+          ],
+          Limit: 1,
+        });
+        const owner = rows[0]?.tokenOwner;
+        wrapperOwnerCache.set(wrapper, owner && isAddress(owner) ? getAddress(owner) : null);
+      } catch {
+        wrapperOwnerCache.set(wrapper, null);
+      }
+    })
+  );
+}
+
+function describeTransferToken(row: TransferRow): {
+  amount: bigint;
+  kindLabel: string;
+  avatarBehind: string | null;
+} {
+  const type = row.type || '';
+  const tokenType = row.tokenType || '';
+  const rawValue = BigInt(row.value || 0);
+
+  if (type === 'CrcV2_Erc20WrapperTransfer') {
+    const wrapper = (row.tokenAddress || '').toLowerCase();
+    const avatarBehind = wrapperOwnerCache.get(wrapper) || null;
+    if (tokenType === 'CrcV2_ERC20WrapperDeployed_Inflationary') {
+      // Inflationary wrappers hold static units — convert to demurraged CRC at
+      // the transfer's own timestamp, so the row shows what the transfer was
+      // actually worth when it happened.
+      let demurraged = rawValue;
+      try {
+        demurraged = CirclesConverter.attoStaticCirclesToAttoCircles(
+          rawValue,
+          BigInt(row.timestamp || Math.floor(Date.now() / 1000))
+        );
+      } catch {
+        /* fall back to the raw static amount */
+      }
+      // The main number is the demurraged value at transfer time; the static
+      // (inflationary-unit) amount stays visible in the label for clarity.
+      const staticWhole = Number(rawValue) / 1e18;
+      return {
+        amount: demurraged,
+        kindLabel: `ERC20 · inflationary (${staticWhole.toFixed(2)} static)`,
+        avatarBehind,
+      };
+    }
+    return { amount: rawValue, kindLabel: 'ERC20 · demurraged', avatarBehind };
+  }
+
+  // ERC1155 hub transfers: tokenAddress IS the avatar behind the token.
+  const avatarBehind =
+    row.tokenAddress && isAddress(row.tokenAddress) ? getAddress(row.tokenAddress) : null;
+  const kindLabel =
+    tokenType === 'CrcV2_RegisterGroup'
+      ? 'Group CRC'
+      : tokenType === 'CrcV2_RegisterHuman'
+        ? 'Personal CRC'
+        : 'CRC';
+  return { amount: rawValue, kindLabel, avatarBehind };
+}
+
+// Activity amounts round to the NEAREST 2 decimals (unlike the truncating
+// balance formatter): demurrage-shaved values like 47.999952 read as the 48
+// they represent, instead of a puzzling 47.999.
+function formatActivityAmount(atto: bigint): string {
+  const HUNDREDTH = 10n ** 16n;
+  // Below one cent: show "<0.01" instead of a misleading 0 or 0.01.
+  if (atto > 0n && atto < HUNDREDTH) return '<0.01';
+  const rounded = (atto + HUNDREDTH / 2n) / HUNDREDTH; // half-up, in hundredths
+  const whole = rounded / 100n;
+  const cents = rounded % 100n;
+  return `${whole}.${cents.toString().padStart(2, '0')}`;
+}
+
+function explorerNameFor(address: string | null): string | null {
+  if (!address) return null;
+  const cached = explorerProfileCache.get(address.toLowerCase());
+  return cached?.name || null;
+}
+
+function shortenExplorerAddress(address: string): string {
+  return address ? `${address.slice(0, 6)}…${address.slice(-4)}` : '';
+}
+
+function explorerPartyHtml(address: string | null): string {
+  if (!address || address === zeroAddress) return '<span class="muted">—</span>';
+  const name = explorerNameFor(address);
+  const label = name
+    ? escapeHtml(name)
+    : `<span class="mono">${escapeHtml(shortenExplorerAddress(address))}</span>`;
+  return `<a class="org-link" href="https://explorer.aboutcircles.com/avatar/${escapeHtml(address)}/" target="_blank" rel="noopener" title="${escapeHtml(address)}">${label}</a>`;
+}
+
+function renderActivityRows(rows: TransferRow[], orgAddressLower: string, append: boolean): void {
+  const html = rows
+    .map((row) => {
+      const from = (row.from || '').toLowerCase();
+      const isMint = from === zeroAddress;
+      const isBurn = (row.to || '').toLowerCase() === zeroAddress;
+      const incoming = (row.to || '').toLowerCase() === orgAddressLower;
+      const { amount, kindLabel, avatarBehind } = describeTransferToken(row);
+      const counterparty = incoming ? row.from : row.to;
+      const directionLabel = isMint ? 'Mint' : isBurn ? 'Burn' : incoming ? 'In' : 'Out';
+      const directionClass = incoming && !isBurn ? 'activity-in' : 'activity-out';
+      const sign = incoming ? '+' : '−';
+      const when = row.timestamp
+        ? new Date(Number(row.timestamp) * 1000).toLocaleString([], {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        : '';
+      const avatarBehindHtml = avatarBehind
+        ? `<span class="muted">· token of ${explorerPartyHtml(avatarBehind)}</span>`
+        : '';
+
+      return `
+        <div class="trust-item activity-item">
+          <div class="activity-main">
+            <div class="activity-top">
+              <span class="activity-direction ${directionClass}">${directionLabel}</span>
+              <span>${incoming ? 'from' : 'to'} ${explorerPartyHtml(counterparty)}</span>
+            </div>
+            <div class="activity-meta muted">
+              ${escapeHtml(kindLabel)} ${avatarBehindHtml} · ${escapeHtml(when)}
+              · <a class="org-link" href="https://gnosisscan.io/tx/${escapeHtml(row.transactionHash || '')}" target="_blank" rel="noopener">tx</a>
+            </div>
+          </div>
+          <span class="activity-amount ${directionClass}">${sign}${escapeHtml(formatActivityAmount(amount))}</span>
+        </div>
+      `;
+    })
+    .join('');
+
+  if (append) {
+    explorerActivityList.insertAdjacentHTML('beforeend', html);
+  } else {
+    explorerActivityList.innerHTML =
+      html || '<p class="muted">No transfers found for this address.</p>';
+  }
+}
+
+async function fetchActivityPage(
+  orgAddress: string,
+  cursor: { blockNumber: number; logIndex: number } | null
+): Promise<TransferRow[]> {
+  // The indexer stores addresses lowercased and Equals filters are
+  // case-sensitive — a checksummed value silently matches nothing.
+  const addressValue = orgAddress.toLowerCase();
+  const filter = {
+    Type: 'Conjunction',
+    ConjunctionType: 'Or',
+    Predicates: [
+      { Type: 'FilterPredicate', FilterType: 'Equals', Column: 'from', Value: addressValue },
+      { Type: 'FilterPredicate', FilterType: 'Equals', Column: 'to', Value: addressValue },
+    ],
+  };
+  const predicates = cursor
+    ? [
+        {
+          Type: 'Conjunction',
+          ConjunctionType: 'And',
+          Predicates: [
+            filter,
+            {
+              Type: 'FilterPredicate',
+              FilterType: 'LessThan',
+              Column: 'blockNumber',
+              Value: cursor.blockNumber,
+            },
+          ],
+        },
+      ]
+    : [filter];
+
+  return circlesQuery({
+    Namespace: 'V_CrcV2',
+    Table: 'Transfers',
+    Columns: [],
+    Filter: predicates,
+    Order: [
+      { Column: 'blockNumber', SortOrder: 'DESC' },
+      { Column: 'logIndex', SortOrder: 'DESC' },
+    ],
+    Limit: EXPLORER_PAGE_SIZE,
+  });
+}
+
+async function loadExplorerActivity(
+  orgAddress: string,
+  { append = false }: { append?: boolean } = {}
+): Promise<void> {
+  const seq = ++explorerLoadSeq;
+  const orgLower = orgAddress.toLowerCase();
+  explorerLoadMoreBtn.classList.add('hidden');
+  if (!append) {
+    explorerActivityList.innerHTML = '<div class="shimmer-block"></div>';
+    explorerActivityWrap.classList.remove('hidden');
+  }
+
+  try {
+    const rows = await fetchActivityPage(orgAddress, append ? explorerCursor : null);
+    if (seq !== explorerLoadSeq) return;
+
+    // Resolve wrapper owners first so token avatars join the profile batch.
+    const wrapperAddrs = rows
+      .filter((r) => r.type === 'CrcV2_Erc20WrapperTransfer' && r.tokenAddress)
+      .map((r) => r.tokenAddress);
+    await resolveWrapperOwners(wrapperAddrs);
+
+    const partyAddrs = rows.flatMap((r) => {
+      const { avatarBehind } = describeTransferToken(r);
+      return [r.from, r.to, avatarBehind].filter((a) => a && isAddress(a));
+    });
+    await fetchExplorerProfiles(partyAddrs);
+    if (seq !== explorerLoadSeq) return;
+
+    if (!append) explorerActivityList.innerHTML = '';
+    renderActivityRows(rows, orgLower, append);
+
+    if (rows.length === EXPLORER_PAGE_SIZE) {
+      const last = rows[rows.length - 1];
+      explorerCursor = { blockNumber: last.blockNumber, logIndex: last.logIndex };
+      explorerLoadMoreBtn.classList.remove('hidden');
+    } else {
+      explorerCursor = null;
+    }
+  } catch (err) {
+    if (seq !== explorerLoadSeq) return;
+    if (!append) {
+      explorerActivityList.innerHTML = `<p class="muted">Could not load activity: ${escapeHtml(decodeError(err))}</p>`;
+    }
+  }
+}
+
+async function exploreOrganization(rawAddress?: string): Promise<void> {
+  const value = (rawAddress || explorerAddressInput?.value || '').trim();
+  if (!isAddress(value)) {
+    showResult('error', 'Enter a valid 0x… address to explore.');
+    return;
+  }
+  hideResult();
+
+  const orgAddress = getAddress(value);
+  explorerOrg = orgAddress.toLowerCase();
+  explorerCursor = null;
+
+  explorerOrgHeader.classList.remove('hidden');
+  explorerOrgName.textContent = '…';
+  explorerOrgAddressEl.textContent = orgAddress;
+  explorerOrgAddressEl.href = `https://explorer.aboutcircles.com/avatar/${orgAddress}/`;
+  explorerOrgTypeEl.classList.add('hidden');
+  explorerOrgDescription.classList.add('hidden');
+  explorerOrgAvatarWrap.classList.add('hidden');
+
+  // Avatar info + profile load in parallel with the first activity page.
+  const headerLoad = (async () => {
+    try {
+      const rows = await circlesQuery({
+        Namespace: 'V_Crc',
+        Table: 'Avatars',
+        Columns: [],
+        Filter: [
+          { Type: 'FilterPredicate', FilterType: 'Equals', Column: 'avatar', Value: explorerOrg },
+        ],
+        Limit: 1,
+      });
+      const info = rows[0] || null;
+      const typeLower = (info?.type || '').toLowerCase();
+      explorerOrgTypeEl.textContent = typeLower.includes('organization')
+        ? 'Organization'
+        : typeLower.includes('group')
+          ? 'Group'
+          : typeLower.includes('human')
+            ? 'Human'
+            : 'Unregistered';
+      explorerOrgTypeEl.classList.remove('hidden');
+    } catch {
+      /* type badge is cosmetic */
+    }
+
+    try {
+      await fetchExplorerProfiles([orgAddress]);
+      const profile = explorerProfileCache.get(explorerOrg!);
+      explorerOrgName.textContent = profile?.name || shortenExplorerAddress(orgAddress);
+      if (profile?.imageUrl) {
+        explorerOrgAvatar.src = profile.imageUrl;
+        explorerOrgAvatarWrap.classList.remove('hidden');
+      }
+    } catch {
+      explorerOrgName.textContent = shortenExplorerAddress(orgAddress);
+    }
+  })();
+
+  await Promise.all([headerLoad, loadExplorerActivity(orgAddress)]);
+}
+
+function openExplorer(): void {
+  explorerReturnTo = null;
+  hideAllSections();
+  hideResult();
+  explorerSection.classList.remove('hidden');
+  explorerAddressInput?.focus();
+}
+
+// From an open org's dashboard: jump straight to that org's activity.
+function openExplorerForActiveOrg(): void {
+  if (!activeOrgAddress) return;
+  explorerReturnTo = 'dashboard';
+  hideAllSections();
+  hideResult();
+  explorerSection.classList.remove('hidden');
+  if (explorerAddressInput) explorerAddressInput.value = activeOrgAddress;
+  exploreOrganization(activeOrgAddress);
+}
+
+function closeExplorer(): void {
+  explorerSection.classList.add('hidden');
+  hideResult();
+  if (explorerReturnTo === 'dashboard' && activeOrgAddress) {
+    explorerReturnTo = null;
+    dashboardSection.classList.remove('hidden');
+    return;
+  }
+  explorerReturnTo = null;
+  if (connectedAddress) {
+    optionsSection.classList.remove('hidden');
+  } else {
+    loginSection.classList.remove('hidden');
+  }
+}
+
+loginExploreBtn?.addEventListener('click', openExplorer);
+optionsExploreBtn?.addEventListener('click', openExplorer);
+viewOrgActivityBtn?.addEventListener('click', openExplorerForActiveOrg);
+explorerBackBtn?.addEventListener('click', closeExplorer);
+explorerLoadBtn?.addEventListener('click', () => exploreOrganization());
+explorerAddressInput?.addEventListener('keydown', (e: KeyboardEvent) => {
+  if (e.key === 'Enter') exploreOrganization();
+});
+explorerLoadMoreBtn?.addEventListener('click', () => {
+  if (explorerOrg) loadExplorerActivity(getAddress(explorerOrg), { append: true });
+});
 
 /* ── Init ─────────────────────────────────────────────────────────── */
 

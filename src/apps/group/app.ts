@@ -60,6 +60,8 @@ const MAX_DESCRIPTION_LENGTH = 600;
 const MAX_LINK_LABEL_LENGTH = 48;
 const TICKER_PATTERN = /^[A-Z0-9]{2,8}$/;
 const MEMBER_PAGE_LIMIT = 50;
+const WISHLIST_PAGE_LIMIT = 50;
+const WISHLIST_FALLBACK_RPC_URL = 'https://rpc.staging.aboutcircles.com/';
 const GROUP_PAGE_LIMIT = 50;
 const MEMBER_SEARCH_V2_AVATAR_TYPES = [
   'CrcV2_RegisterHuman',
@@ -125,6 +127,14 @@ let membersHasMorePages = false;
 let loadedMembersGroupAddress: any = null;
 let membersLoadRequestId = 0;
 let selectedMembers = new Set<string>();
+let wishlistPages: any[][] = [];
+let wishlistNextCursor: string | null = null;
+let wishlistHasMore = false;
+let currentWishlistPageIndex = 0;
+let selectedWishlistEntries = new Set<string>();
+let loadedWishlistGroupAddress: string | null = null;
+let wishlistLoadRequestId = 0;
+let wishlistMemberStatusByAddress = new Map<string, boolean>();
 let ownerSafeOwners: any[] = [];
 let ownerSafeThreshold: any = null;
 let activeMembershipConditions: any[] = [];
@@ -266,6 +276,17 @@ const membersSelectionToolbarEl = byId('members-selection-toolbar');
 const membersSelectAllInput = byId('members-select-all');
 const membersSelectionCountEl = byId('members-selection-count');
 const membersRemoveSelectedBtn = byId('members-remove-selected-btn');
+
+const groupWishlistPanelEl = byId('group-wishlist-panel');
+const wishlistListEl = byId('wishlist-list');
+const wishlistTotalCountEl = byId('wishlist-total-count');
+const wishlistPageLabelEl = byId('wishlist-page-label');
+const wishlistPrevBtn = byId('wishlist-prev-btn');
+const wishlistNextBtn = byId('wishlist-next-btn');
+const wishlistSelectionToolbarEl = byId('wishlist-selection-toolbar');
+const wishlistSelectAllInput = byId('wishlist-select-all');
+const wishlistSelectionCountEl = byId('wishlist-selection-count');
+const wishlistTrustSelectedBtn = byId('wishlist-trust-selected-btn');
 
 const groupTokenCardTitleEl = byId('group-token-card-title');
 const groupTokenCardCopyEl = byId('group-token-card-copy');
@@ -481,6 +502,7 @@ function hideGroupManagementPanels() {
   groupDetailsPanelEl.classList.add('hidden');
   groupAdminsPanelEl.classList.add('hidden');
   groupMembersPanelEl.classList.add('hidden');
+  groupWishlistPanelEl.classList.add('hidden');
   groupTokensPanelEl.classList.add('hidden');
 }
 
@@ -500,6 +522,23 @@ function resetMembersState() {
   membersPrevBtn.disabled = true;
   membersNextBtn.disabled = true;
   updateMembersSelectionUI();
+}
+
+function resetWishlistState() {
+  wishlistPages = [];
+  wishlistNextCursor = null;
+  wishlistHasMore = false;
+  currentWishlistPageIndex = 0;
+  selectedWishlistEntries = new Set();
+  loadedWishlistGroupAddress = null;
+  wishlistMemberStatusByAddress = new Map();
+  wishlistLoadRequestId += 1;
+  wishlistListEl.innerHTML = '<p class="muted">Open Join Requests to load entries.</p>';
+  wishlistTotalCountEl.textContent = '0 requests';
+  wishlistPageLabelEl.textContent = 'Page 1';
+  wishlistPrevBtn.disabled = true;
+  wishlistNextBtn.disabled = true;
+  updateWishlistSelectionUI();
 }
 
 function resetOwnerSafeState() {
@@ -557,6 +596,14 @@ function showGroupManagementPanel(panel) {
     groupMembersPanelEl.classList.remove('hidden');
     if (activeGroupMeta?.group && loadedMembersGroupAddress !== activeGroupMeta.group) {
       void loadMembers();
+    }
+    return;
+  }
+
+  if (panel === 'wishlist') {
+    groupWishlistPanelEl.classList.remove('hidden');
+    if (activeGroupMeta?.group && loadedWishlistGroupAddress !== activeGroupMeta.group) {
+      void loadWishlist();
     }
     return;
   }
@@ -1707,10 +1754,14 @@ function mergeGroups(...groupLists) {
 
 async function fetchGroupsByOwners(ownerIn) {
   if (!humanSdk || !ownerIn.length) return [];
-  const page = await humanSdk.rpc.group.findGroups(GROUP_PAGE_LIMIT, {
+  // getGroups queries the V_CrcV2 Groups view directly. The server-side
+  // circles_findGroups method returns an empty set for ownerIn filters (and
+  // silently drops groupAddressIn), so findGroups() must not be used here.
+  const query = humanSdk.rpc.group.getGroups(GROUP_PAGE_LIMIT, {
     ownerIn: normalizeAddressList(ownerIn),
   });
-  return normalizeGroups(page?.results || []);
+  await query.queryNextPage();
+  return normalizeGroups(query.currentPage?.results || []);
 }
 
 async function loadAllPages(query, maxPages = 6) {
@@ -2747,6 +2798,321 @@ async function removeMembers(rawAddresses) {
   }
 }
 
+/* ── Join Requests (affiliate wishlist) ──────────────────────────── */
+// The wishlist method isn't on the production RPC yet; fall back to staging on
+// "method not found" and pin whichever URL answered for the rest of the session.
+let wishlistRpcUrl: string | null = null;
+
+async function fetchWishlistPage(groupAddress: string, cursor: string | null): Promise<any> {
+  const params: any[] = [groupAddress, WISHLIST_PAGE_LIMIT];
+  if (cursor) params.push(cursor);
+  const body = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'circles_getAffiliateGroupMembersWishlist',
+    params,
+  });
+
+  const candidateUrls = wishlistRpcUrl ? [wishlistRpcUrl] : [RPC_URL, WISHLIST_FALLBACK_RPC_URL];
+  let lastError: any = null;
+
+  for (const url of candidateUrls) {
+    let json: any;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      json = await res.json();
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
+
+    if (json?.error) {
+      lastError = new Error(json.error.message || 'Wishlist request failed');
+      if (json.error.code === -32601) continue;
+      throw lastError;
+    }
+
+    wishlistRpcUrl = url;
+    return json?.result || { results: [], hasMore: false, nextCursor: null };
+  }
+
+  throw lastError || new Error('Wishlist request failed');
+}
+
+function formatRelativeTime(unixSeconds: number | string): string {
+  const seconds = Number(unixSeconds || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const deltaSeconds = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+  if (deltaSeconds < 60) return 'just now';
+  const minutes = Math.floor(deltaSeconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days <= 30) return `${days}d ago`;
+  return new Date(seconds * 1000).toLocaleDateString();
+}
+
+async function hydrateWishlistMemberStatus(rows: any[]): Promise<void> {
+  await Promise.all(
+    rows.map(async (row) => {
+      const key = row.avatarAddress.toLowerCase();
+      if (wishlistMemberStatusByAddress.has(key)) return;
+
+      const cachedStatus = cachedMembers.some(
+        (member: any) => member.member.toLowerCase() === key
+      );
+      if (cachedStatus || !activeGroupAvatar) {
+        wishlistMemberStatusByAddress.set(key, cachedStatus);
+        return;
+      }
+
+      try {
+        wishlistMemberStatusByAddress.set(
+          key,
+          Boolean(await activeGroupAvatar.trust.isTrusting(row.avatarAddress))
+        );
+      } catch {
+        wishlistMemberStatusByAddress.set(key, false);
+      }
+    })
+  );
+}
+
+function updateWishlistToolbar(): void {
+  const loadedCount = wishlistPages.reduce((sum, page) => sum + page.length, 0);
+  const suffix = wishlistHasMore ? '+' : '';
+  const plural = loadedCount === 1 && !wishlistHasMore ? '' : 's';
+  wishlistTotalCountEl.textContent = `${loadedCount}${suffix} request${plural}`;
+  wishlistPageLabelEl.textContent = `Page ${currentWishlistPageIndex + 1}`;
+  wishlistPrevBtn.disabled = currentWishlistPageIndex === 0;
+  wishlistNextBtn.disabled =
+    !wishlistHasMore && currentWishlistPageIndex >= wishlistPages.length - 1;
+}
+
+function getCurrentWishlistPageSelectableAddresses(): string[] {
+  const rows = wishlistPages[currentWishlistPageIndex] || [];
+  return rows
+    .map((row: any) => getAddress(row.avatarAddress))
+    .filter((address: string) => !wishlistMemberStatusByAddress.get(address.toLowerCase()));
+}
+
+function updateWishlistSelectionUI(): void {
+  if (!wishlistSelectionToolbarEl) return;
+
+  const selectableAddresses = getCurrentWishlistPageSelectableAddresses();
+  const hasRows = (wishlistPages[currentWishlistPageIndex] || []).length > 0;
+
+  if (!hasRows && selectedWishlistEntries.size === 0) {
+    wishlistSelectionToolbarEl.classList.add('hidden');
+  } else {
+    wishlistSelectionToolbarEl.classList.remove('hidden');
+  }
+
+  const pageKeysSelected = selectableAddresses.filter((addr) =>
+    selectedWishlistEntries.has(addr.toLowerCase())
+  ).length;
+
+  if (wishlistSelectAllInput) {
+    wishlistSelectAllInput.disabled = selectableAddresses.length === 0;
+    wishlistSelectAllInput.checked =
+      selectableAddresses.length > 0 && pageKeysSelected === selectableAddresses.length;
+    wishlistSelectAllInput.indeterminate =
+      pageKeysSelected > 0 && pageKeysSelected < selectableAddresses.length;
+  }
+
+  const totalSelected = selectedWishlistEntries.size;
+  if (wishlistSelectionCountEl) {
+    wishlistSelectionCountEl.textContent = `${totalSelected} selected`;
+  }
+  if (wishlistTrustSelectedBtn) {
+    wishlistTrustSelectedBtn.disabled = totalSelected === 0;
+    wishlistTrustSelectedBtn.textContent =
+      totalSelected > 1 ? `Trust ${totalSelected} selected` : 'Trust selected';
+  }
+}
+
+function renderWishlistPage(): void {
+  updateWishlistToolbar();
+
+  const rows = wishlistPages[currentWishlistPageIndex] || [];
+  if (!rows.length) {
+    wishlistListEl.innerHTML = '<p class="muted">No join requests yet.</p>';
+    updateWishlistSelectionUI();
+    return;
+  }
+
+  wishlistListEl.innerHTML = rows
+    .map((row: any) => {
+      const address = getAddress(row.avatarAddress);
+      const key = address.toLowerCase();
+      const isAlreadyMember = wishlistMemberStatusByAddress.get(key) || false;
+      const checked = selectedWishlistEntries.has(key) ? 'checked' : '';
+      const requestedAt = formatRelativeTime(row.timestamp);
+      return `
+        <div class="list-row search-result-row member-row">
+          <label class="member-row-select checkbox-inline">
+            <input type="checkbox" class="wishlist-select-checkbox" data-avatar="${escapeHtml(address)}" ${checked} ${isAlreadyMember ? 'disabled' : ''} />
+          </label>
+          <div class="list-row-main">
+            <div class="list-row-title">${escapeHtml(String(row.avatarName || '').trim() || address)}</div>
+            <div class="list-row-meta mono">${escapeHtml(address)}</div>
+            ${requestedAt ? `<div class="list-row-meta">Interested ${escapeHtml(requestedAt)}</div>` : ''}
+          </div>
+          <div class="list-row-action-stack">
+            ${isAlreadyMember ? '<span class="chip">Member</span>' : ''}
+            <button class="wishlist-add-btn btn-inline" data-avatar="${escapeHtml(address)}" ${isAlreadyMember ? 'disabled' : ''}>
+              ${isAlreadyMember ? 'Added' : 'Add'}
+            </button>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+
+  wishlistListEl.querySelectorAll('.wishlist-add-btn').forEach((button: any) => {
+    button.addEventListener('click', () => void trustWishlistEntries([button.dataset.avatar]));
+  });
+
+  wishlistListEl.querySelectorAll('.wishlist-select-checkbox').forEach((input: any) => {
+    input.addEventListener('change', () => {
+      const key = String(input.dataset.avatar || '').toLowerCase();
+      if (!key) return;
+      if (input.checked) selectedWishlistEntries.add(key);
+      else selectedWishlistEntries.delete(key);
+      updateWishlistSelectionUI();
+    });
+  });
+
+  updateWishlistSelectionUI();
+}
+
+async function ensureWishlistPage(pageIndex: number): Promise<boolean> {
+  if (wishlistPages[pageIndex]) return true;
+  if (!activeGroupMeta?.group) return false;
+
+  while (wishlistPages.length <= pageIndex) {
+    if (wishlistPages.length > 0 && !wishlistHasMore) return false;
+    const cursor = wishlistPages.length === 0 ? null : wishlistNextCursor;
+    const page = await fetchWishlistPage(activeGroupMeta.group, cursor);
+    const rows = (page.results || []).filter(
+      (row: any) => row?.avatarAddress && isAddress(row.avatarAddress)
+    );
+    wishlistPages.push(rows);
+    wishlistHasMore = Boolean(page.hasMore);
+    wishlistNextCursor = page.nextCursor || null;
+    await hydrateWishlistMemberStatus(rows);
+  }
+
+  return Boolean(wishlistPages[pageIndex]);
+}
+
+async function goToWishlistPage(pageIndex: number): Promise<void> {
+  if (pageIndex < 0) return;
+
+  const requestId = ++wishlistLoadRequestId;
+  wishlistListEl.innerHTML = '<p class="muted">Loading join requests…</p>';
+
+  try {
+    const ready = await ensureWishlistPage(pageIndex);
+    if (requestId !== wishlistLoadRequestId) return;
+    if (ready) currentWishlistPageIndex = pageIndex;
+    renderWishlistPage();
+  } catch (err) {
+    if (requestId !== wishlistLoadRequestId) return;
+    wishlistListEl.innerHTML = `<p class="muted">Could not load join requests: ${escapeHtml(decodeError(err))}</p>`;
+  }
+}
+
+async function loadWishlist(): Promise<void> {
+  if (!activeGroupMeta?.group) return;
+
+  const groupAddress = activeGroupMeta.group;
+  wishlistPages = [];
+  wishlistNextCursor = null;
+  wishlistHasMore = false;
+  currentWishlistPageIndex = 0;
+  selectedWishlistEntries = new Set();
+  wishlistMemberStatusByAddress = new Map();
+  loadedWishlistGroupAddress = null;
+  updateWishlistToolbar();
+
+  await goToWishlistPage(0);
+  if (activeGroupMeta?.group === groupAddress && wishlistPages.length > 0) {
+    loadedWishlistGroupAddress = groupAddress;
+  }
+}
+
+async function trustWishlistEntries(rawAddresses: Array<string | undefined>): Promise<void> {
+  if (!activeGroupAvatar) {
+    showResult('error', 'Open a group first.');
+    return;
+  }
+
+  const addresses: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawAddresses || []) {
+    if (!raw || !isAddress(raw)) continue;
+    const checksummed = getAddress(raw);
+    const key = checksummed.toLowerCase();
+    if (seen.has(key) || wishlistMemberStatusByAddress.get(key)) continue;
+    seen.add(key);
+    addresses.push(checksummed);
+  }
+
+  if (!addresses.length) {
+    showResult('error', 'No valid addresses to trust.');
+    return;
+  }
+
+  const isBatch = addresses.length > 1;
+  if (isBatch) {
+    const confirmed = await showConfirmModal({
+      title: `Trust ${addresses.length} people?`,
+      message: `This will add ${addresses.length} people as group members in a single transaction.`,
+      confirmLabel: 'Trust',
+    });
+    if (!confirmed) return;
+  }
+
+  if (wishlistTrustSelectedBtn) wishlistTrustSelectedBtn.disabled = true;
+  showResult(
+    'pending',
+    isBatch ? `Trusting ${addresses.length} people…` : `Trusting ${addresses[0]}…`
+  );
+
+  try {
+    lastTxHashes = [];
+    await activeGroupAvatar.trust.add(addresses);
+    const links = lastTxHashes.length ? `<br>${txLinks(lastTxHashes)}` : '';
+    showResult(
+      'success',
+      isBatch
+        ? `Added ${addresses.length} members.${links}`
+        : `Member added: ${addresses[0]}.${links}`
+    );
+    for (const addr of addresses) {
+      const key = addr.toLowerCase();
+      selectedWishlistEntries.delete(key);
+      wishlistMemberStatusByAddress.set(key, true);
+    }
+    setActiveMemberCount(getMembersTotalCount() + addresses.length);
+    loadedMembersGroupAddress = null;
+    renderWishlistPage();
+  } catch (err) {
+    showResult(
+      'error',
+      `Could not trust ${isBatch ? 'selected people' : addresses[0]}: ${decodeError(err)}`
+    );
+  } finally {
+    updateWishlistSelectionUI();
+  }
+}
+
 async function loadTreasuryPanels() {
   if (!humanSdk || !activeGroupMeta || !activeGroupAvatar) return;
 
@@ -3305,10 +3671,12 @@ async function openGroup(groupAddress, preserveResult = false) {
 
   let groupMeta = getResolvedGroupMeta(groupAddress);
   if (!groupMeta) {
-    const lookupPage = await humanSdk.rpc.group.findGroups(1, {
+    // getGroups, not findGroups: the latter drops the groupAddressIn filter.
+    const lookupQuery = humanSdk.rpc.group.getGroups(1, {
       groupAddressIn: [getAddress(groupAddress)],
     });
-    groupMeta = lookupPage?.results?.[0] || null;
+    await lookupQuery.queryNextPage();
+    groupMeta = lookupQuery.currentPage?.results?.[0] || null;
   }
 
   if (!groupMeta) {
@@ -3349,6 +3717,7 @@ async function openGroup(groupAddress, preserveResult = false) {
     serviceAddressInput.value = activeGroupMeta.service || '';
     feeCollectionInput.value = activeGroupMeta.feeCollection || '';
     resetMembersState();
+    resetWishlistState();
     resetOwnerSafeState();
     resetMembershipConditionsState();
     sendRecipientInput.value = '';
@@ -3453,6 +3822,7 @@ onWalletChange(async (address) => {
   cachedFeeAddressGroupTokenAmount = 0n;
   lastTxHashes = [];
   resetOwnerSafeState();
+  resetWishlistState();
   resetMembershipConditionsState();
   clearMemberSearchResults();
   clearSendSearchResults();
@@ -3650,6 +4020,34 @@ membersSelectAllInput?.addEventListener('change', () => {
 membersRemoveSelectedBtn?.addEventListener('click', () => {
   if (!selectedMembers.size) return;
   void removeMembers(Array.from(selectedMembers));
+});
+
+wishlistPrevBtn.addEventListener('click', () => {
+  if (currentWishlistPageIndex === 0) return;
+  void goToWishlistPage(currentWishlistPageIndex - 1);
+});
+wishlistNextBtn.addEventListener('click', () => {
+  void goToWishlistPage(currentWishlistPageIndex + 1);
+});
+
+wishlistSelectAllInput?.addEventListener('change', () => {
+  const selectableAddresses = getCurrentWishlistPageSelectableAddresses();
+  if (wishlistSelectAllInput.checked) {
+    for (const addr of selectableAddresses) selectedWishlistEntries.add(addr.toLowerCase());
+  } else {
+    for (const addr of selectableAddresses) selectedWishlistEntries.delete(addr.toLowerCase());
+  }
+  wishlistListEl.querySelectorAll('.wishlist-select-checkbox').forEach((input: any) => {
+    if (input.disabled) return;
+    const key = String(input.dataset.avatar || '').toLowerCase();
+    input.checked = selectedWishlistEntries.has(key);
+  });
+  updateWishlistSelectionUI();
+});
+
+wishlistTrustSelectedBtn?.addEventListener('click', () => {
+  if (!selectedWishlistEntries.size) return;
+  void trustWishlistEntries(Array.from(selectedWishlistEntries));
 });
 
 sendRecipientInput.addEventListener('input', updateSendSearchResults);

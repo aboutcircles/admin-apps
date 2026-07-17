@@ -35,12 +35,6 @@ function parseRoute(): string {
   return hash || '';
 }
 
-function setActiveNav(route: string): void {
-  document.querySelectorAll<HTMLAnchorElement>('.mm-nav-link').forEach((a) => {
-    a.classList.toggle('active', a.dataset.route === route);
-  });
-}
-
 function renderLanding(): void {
   ROOT.innerHTML = `
     <div class="mm-landing">
@@ -72,7 +66,6 @@ function hideAllContainers(): void {
 
 async function navigate(): Promise<void> {
   const route = parseRoute();
-  setActiveNav(route);
 
   // Landing page.
   if (!route) {
@@ -133,6 +126,21 @@ async function navigate(): Promise<void> {
     }
   } catch (err) {
     loadingEl.remove();
+
+    // A failed dynamic import means this page's hashed chunk names no longer
+    // exist on the server (a deploy replaced them while this tab held the old
+    // index.html). Reload once to pick up the fresh HTML — guarded through
+    // sessionStorage so a genuinely broken deploy can't reload-loop.
+    const isStaleChunk =
+      err instanceof TypeError && /dynamically imported module|module script/i.test(String(err));
+    const reloadGuard = `mm-chunk-reload:${route}`;
+    if (isStaleChunk && !sessionStorage.getItem(reloadGuard)) {
+      sessionStorage.setItem(reloadGuard, '1');
+      window.location.reload();
+      return;
+    }
+    sessionStorage.removeItem(reloadGuard);
+
     const errEl = document.createElement('div');
     errEl.className = 'mm-loading';
     errEl.textContent = `Failed to load the "${route}" app. Check the console for details.`;

@@ -216,6 +216,14 @@ export const HTML = `
                         <strong class="management-picker-title">Members</strong>
                         <span class="management-picker-copy">Add or remove trusted members.</span>
                     </button>
+                    <button type="button" class="panel management-card management-picker"
+                        data-management-view="wishlist">
+                        <span class="management-picker-kicker">Manage</span>
+                        <strong class="management-picker-title">Join Requests</strong>
+                        <span class="management-picker-copy">Review people interested in joining and add them as
+                            members.</span>
+                    </button>
+
 
                     <button type="button" class="panel management-card management-picker" data-management-view="tokens">
                         <span class="management-picker-kicker">Manage</span>
@@ -544,6 +552,35 @@ export const HTML = `
                             <p class="muted">Open a group to load members.</p>
                         </div>
                     </div>
+                    <div id="group-wishlist-panel" class="panel management-detail hidden">
+                        <div class="panel-head">
+                            <h2>Join Requests</h2>
+                            <button type="button" class="btn-ghost btn-small" data-management-back="1">Back</button>
+                        </div>
+
+                        <div class="management-toolbar">
+                            <span id="wishlist-total-count" class="muted">0 requests</span>
+                            <div class="management-toolbar-actions">
+                                <button id="wishlist-prev-btn" type="button" class="btn-tonal btn-small">Prev</button>
+                                <span id="wishlist-page-label" class="muted">Page 1</span>
+                                <button id="wishlist-next-btn" type="button" class="btn-tonal btn-small">Next</button>
+                            </div>
+                        </div>
+
+                        <div id="wishlist-selection-toolbar" class="members-selection-toolbar hidden">
+                            <label class="checkbox-inline">
+                                <input id="wishlist-select-all" type="checkbox" />
+                                <span>Select all on page</span>
+                            </label>
+                            <span id="wishlist-selection-count" class="muted">0 selected</span>
+                            <button id="wishlist-trust-selected-btn" type="button" class="btn-inline btn-small"
+                                disabled>Trust selected</button>
+                        </div>
+                        <div id="wishlist-list" class="stack-list">
+                            <p class="muted">Open a group to load join requests.</p>
+                        </div>
+                    </div>
+
 
                     <div id="group-tokens-panel" class="panel management-detail hidden">
                         <div class="panel-head">

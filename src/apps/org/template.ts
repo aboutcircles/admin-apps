@@ -20,6 +20,7 @@ export const HTML = `    <div class="app-shell">
                         dedicated organization accounts. Each account can have its own profile and setup for a
                         different application, such as app-specific logic or a shop.</p>
                 </div>
+                <button id="login-explore-btn" class="btn-secondary">Explore Organizations</button>
             </div>
 
             <!-- ── Options Section ───────────────────────────────────── -->
@@ -42,6 +43,52 @@ export const HTML = `    <div class="app-shell">
                         <line x1="5" y1="12" x2="19" y2="12" />
                     </svg>
                     Create Organization
+                </button>
+                <button id="options-explore-btn" class="btn-secondary">Explore Organizations</button>
+            </div>
+
+            <!-- ── Explorer Section ──────────────────────────────────── -->
+            <div id="explorer-section" class="section hidden">
+                <h2>Explore Organizations</h2>
+                <p class="section-desc">
+                    Paste any organization address to inspect its incoming and outgoing Circles activity.
+                </p>
+                <div class="field">
+                    <div class="input-row">
+                        <input type="text" id="explorer-address" placeholder="0x… organization address"
+                            autocomplete="off" />
+                        <button id="explorer-load-btn">Explore</button>
+                    </div>
+                </div>
+
+                <div id="explorer-org-header" class="info-box org-header-box hidden">
+                    <div class="org-header-top">
+                        <div id="explorer-org-avatar-wrap" class="org-dashboard-avatar-wrap hidden">
+                            <img id="explorer-org-avatar" class="org-dashboard-avatar" alt="" />
+                        </div>
+                        <div class="org-header-details">
+                            <div id="explorer-org-name" class="org-header-name">—</div>
+                            <a id="explorer-org-address" class="mono org-link" href="#" target="_blank"
+                                rel="noopener">—</a>
+                        </div>
+                        <span id="explorer-org-type" class="badge badge-success hidden">Organization</span>
+                    </div>
+                    <p id="explorer-org-description" class="org-header-description hidden"></p>
+                </div>
+
+                <div id="explorer-activity" class="subsection hidden">
+                    <h2>Activity</h2>
+                    <div id="explorer-activity-list"></div>
+                    <button id="explorer-load-more-btn" class="btn-secondary hidden">Load more</button>
+                </div>
+
+                <button id="explorer-back-btn" class="btn-secondary">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round">
+                        <line x1="19" y1="12" x2="5" y2="12" />
+                        <polyline points="12 19 5 12 12 5" />
+                    </svg>
+                    Back
                 </button>
             </div>
 
@@ -117,6 +164,13 @@ export const HTML = `    <div class="app-shell">
                         <span id="org-balance-display" class="info-value balance-value">0 CRC</span>
                     </div>
                 </div>
+                <button id="view-org-activity-btn" class="btn-secondary">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                    </svg>
+                    View Activity
+                </button>
                 <button id="back-to-options-btn" class="btn-secondary">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
                         stroke-linecap="round">
