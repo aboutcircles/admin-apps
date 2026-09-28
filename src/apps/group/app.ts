@@ -1601,6 +1601,7 @@ function renderOwnerSafeOwners() {
     return;
   }
 
+  const canRemove = ownerSafeOwners.length > 1;
   ownerSafeOwnersListEl.innerHTML = ownerSafeOwners
     .map((owner) => {
       const isConnectedOwner =
@@ -1611,10 +1612,18 @@ function renderOwnerSafeOwners() {
             <div class="list-row-title mono">${escapeHtml(owner)}</div>
             <div class="list-row-meta">${isConnectedOwner ? 'Connected wallet' : 'Group admin'}</div>
           </div>
+          <div class="list-row-action">
+            <button class="remove-owner-safe-btn btn-tonal btn-small" data-owner="${escapeHtml(owner)}"
+              ${canRemove ? '' : 'disabled title="A Safe must keep at least one owner."'}>Remove</button>
+          </div>
         </div>
       `;
     })
     .join('');
+
+  ownerSafeOwnersListEl.querySelectorAll('.remove-owner-safe-btn').forEach((button) => {
+    button.addEventListener('click', () => void removeOwnerFromOwnerSafe(button.dataset.owner || ''));
+  });
 }
 
 async function loadOwnerSafeDetails() {
@@ -3560,6 +3569,115 @@ async function addOwnerToOwnerSafe(rawOwner?: any) {
     showResult('error', `Could not add owner to the owner Safe: ${decodeError(err)}`);
   } finally {
     addOwnerSafeBtn.disabled = false;
+  }
+}
+
+const SAFE_SENTINEL_OWNER = '0x0000000000000000000000000000000000000001';
+
+async function removeOwnerFromOwnerSafe(ownerToRemove) {
+  if (!activeOwnerSafe || !isAddress(activeOwnerSafe)) {
+    showResult('error', 'This group does not expose an owner Safe.');
+    return;
+  }
+  if (!connectedAddress) {
+    showResult('error', 'Connect a wallet first.');
+    return;
+  }
+
+  let target;
+  try {
+    target = getAddress(ownerToRemove);
+  } catch {
+    showResult('error', 'Invalid owner address.');
+    return;
+  }
+
+  // Re-read on-chain right before building the call: removeOwner needs the
+  // owner that precedes the target in the Safe's linked list, and the list
+  // may have changed since this panel was rendered.
+  let owners;
+  let threshold;
+  try {
+    ({ owners, threshold } = await readSafeOwnersAndThreshold(activeOwnerSafe));
+  } catch (err) {
+    showResult('error', `Could not load Group Admins: ${decodeError(err)}`);
+    return;
+  }
+  ownerSafeOwners = owners;
+  ownerSafeThreshold = threshold;
+
+  const index = owners.findIndex((owner) => owner.toLowerCase() === target.toLowerCase());
+  if (index === -1) {
+    showResult('error', 'That address is not an owner of the owner Safe.');
+    renderOwnerSafeOwners();
+    return;
+  }
+  if (!owners.some((owner) => owner.toLowerCase() === connectedAddress.toLowerCase())) {
+    showResult('error', 'Only an existing Group Admin can remove admins.');
+    return;
+  }
+  if (owners.length <= 1) {
+    showResult('error', 'The owner Safe must keep at least one owner.');
+    return;
+  }
+  if (threshold > 1) {
+    showResult(
+      'error',
+      `This owner Safe uses threshold ${threshold}. The app currently supports owner changes only for threshold 1 Safes.`
+    );
+    return;
+  }
+
+  const safeAbi = safeSingletonDeployment?.abi;
+  if (!safeAbi) {
+    showResult('error', 'Safe deployment metadata unavailable.');
+    return;
+  }
+
+  const isSelf = target.toLowerCase() === connectedAddress.toLowerCase();
+  const confirmed = await showConfirmModal({
+    title: 'Remove Safe Owner?',
+    message:
+      `You are removing ${target} as an owner of the owner Safe for ${getActiveGroupLabel()}. ` +
+      (isSelf
+        ? 'This is your connected wallet: you will lose admin access to this group.'
+        : 'They will no longer be able to approve admin actions for the Circles group.'),
+    confirmLabel: 'Remove Safe Owner',
+  });
+  if (!confirmed) {
+    return;
+  }
+
+  const buttons = ownerSafeOwnersListEl.querySelectorAll('.remove-owner-safe-btn');
+  buttons.forEach((button) => ((button as HTMLButtonElement).disabled = true));
+  showResult('pending', 'Removing owner from the owner Safe…');
+
+  try {
+    const prevOwner = index === 0 ? SAFE_SENTINEL_OWNER : owners[index - 1];
+    const data = encodeFunctionData({
+      abi: safeAbi,
+      functionName: 'removeOwner',
+      args: [prevOwner, target, BigInt(threshold || 1)],
+    });
+
+    const ownerSafeRunner = createSafeOwnerRunner(connectedAddress, activeOwnerSafe);
+    lastTxHashes = [];
+    await ownerSafeRunner.sendTransaction([
+      {
+        to: activeOwnerSafe,
+        data,
+        value: 0n,
+      },
+    ]);
+    const links = lastTxHashes.length ? `<br>${txLinks(lastTxHashes)}` : '';
+    showResult('success', `Owner removed from ${activeOwnerSafe}.${links}`);
+    if (isSelf) {
+      await loadAdminGroups(true);
+    }
+  } catch (err) {
+    showResult('error', `Could not remove owner from the owner Safe: ${decodeError(err)}`);
+  } finally {
+    await loadOwnerSafeDetails();
   }
 }
 
